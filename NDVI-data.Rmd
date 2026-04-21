@@ -1,0 +1,222 @@
+---
+title: "NDVI real data for SLOO"
+author: "Cécile Hardouin"
+date: "2026-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+if (!require("remotes")) install.packages("remotes")
+remotes::install_github("ropensci/MODIStsp")
+
+```
+
+```{r}
+library(terra)
+library(geodata)
+library(ggplot2)
+library(dplyr)
+library(MODISTools)
+library(MODIStsp)
+library(spdep)
+```
+# Climate Data
+
+### Variables
+To ensure the dataset is easy to interpret, we are using the following combination:
+
+Dependent Variable (Y): July NDVI (Peak greenness). NDVI stands for Normalized Difference Vegetation Index. 
+
+The NDVI is calculated using the Red and Near-Infrared (NIR) bands. It highlights the difference between visible red light and near-infrared light. This index is sensitive to both the vigor and the density of vegetation.
+
+\begin{tabular}{lc}
+NDVI Value  & Interpretation\\
+0 – 0.2 & Barren soil / Bare ground\\
+0.2 – 0.4 & Sparse vegetation\\
+0.4 – 0.6 & Cropland / Shrubs\\
+0.6 – 0.9 & Dense forest
+\end{tabular}
+
+Explanatory Variable (X1): Elevation (Temperature lapse rate/cold effect).
+Explanatory Variable (X2): Aspect (Slope orientation).
+Explanatory Variable (X3): Slope. On steep slopes, water runoff is fast and soil is thin (low NDVI), whereas on flat areas, the soil is deeper and moister (higher NDVI).
+
+Note that we could use Mean july temperature and/or Annual precipitation (global water availibilty). But this would induce very strong multicollinearity between Elevation, precipitation and Temperature. We choose to keep Elevation, which does not vary across time. 
+
+
+
+### Study Area Selection
+
+A section of the Pyrenees covering fewer than 2,000 pixels, approximately 45km by 45km. We are targeting the central Pyrenees, spanning the border between France (Pyrenees National Park) and Spain (Monte Perdido). This area is ideal as it excludes major metropolitan areas and offers a spectacular environmental gradient.
+
+Study Area Coordinates:North-West Corner: $42.90^{\circ} \text{N}, 0^{\circ} \text{E}$South-East Corner: $42.60^{\circ} \text{N}, 0.4^{\circ} \text{E}$
+
+Area Characteristics: Diverse topography with mild temperatures in the valleys and low to negative temperatures at high altitudes. No large cities, only isolated villages.
+
+Vegetation: Agricultural zones and broadleaf forests, transitioning to barren rock at high elevations.
+
+
+# Explanatory Variables
+We are required to download the data at a 30 arc-second resolution (approximately 1km). Even if res = 2.5 is specified, the system defaults to 0.5 min (30s).
+
+
+```{r}
+# Area of interest  
+ext_region <- ext( 0, 0.4, 42.6, 42.90 )
+
+#elevation
+elev <- worldclim_tile(
+  var = "elev",
+  lon = 0.25, 
+  lat = 42.7, 
+  res = 0.5, 
+  path = "data"
+)
+elev <- crop(elev, ext_region)
+
+# Aspect variable on the original raster (in degrees from 0 to 360)
+# We use the elevation raster as input
+aspect_raw <- terrain(elev, v = "aspect", unit = "degrees")
+
+# Transformation into a "Southness Index" (Insolation proxy)
+# The cosine is at its maximum (1) for South (180°) and minimum (-1) for North (0°)
+southness <- -cos(aspect_raw * pi / 180)
+
+# Slope (in raw degrees without transformation).
+slope <- terrain(elev, v = "slope", unit = "degrees")
+
+
+#Resolution and number of pixels
+res(elev)
+ncell(elev) #1728
+```
+
+### Visualisation  
+
+```{r}
+plot(elev, main="Elevation")
+plot(aspect_raw, main = "Aspect (0-360°)")   # 0° = North, 90° = East, 180° = South, 270° = West
+plot(southness, main = "Southness Index (-1: North, 1: South)")
+plot(slope, main = "Slope (0 to 90 degrees)")
+```
+# NDVI data
+
+```{r}
+# 1. Download at 250m resolution (MOD13Q1)
+# Note: km_lr/km_ab define the box size around the center point
+ndvi_data_raw <- mt_subset(
+  product = "MOD13Q1",
+  band = "250m_16_days_NDVI",
+  lat = 42.7,
+  lon = 0.25,
+  km_lr = 22.5, # Total width of approx 45km (22.5km on each side)
+  km_ab = 24,   # Total height of approx 48km
+  start = "2023-07-16", 
+  end = "2023-07-31"
+)
+
+# 2. Convert to Raster (terra format)
+ndvi_250m <- mt_to_terra(ndvi_data_raw)
+
+# 3. Resample to 1 km resolution: Aggregate by a factor of 4 (4 pixels of 250m = 1000m)
+ndvi_1km <- aggregate(ndvi_250m, fact = 4, fun = mean, na.rm = TRUE)
+
+# 4. Projection (WGS84)
+target_crs <- "EPSG:4326"
+
+# Project the raster: using "bilinear" interpolation for continuous NDVI data
+ndvi_proj <- project(ndvi_1km, target_crs, method = "bilinear")
+
+# 5. Final Cropping
+ndvi_final <- crop(ndvi_proj, ext_region)
+
+# 6. Summary and Visualization
+summary(ndvi_final)
+plot(ndvi_final, main = "1 km NDVI (WGS84)")
+
+# Optional: Gap-filling (Interpolation)
+# Fills NA values using a 3x3 moving window average
+# ndvi_interpolated <- focal(ndvi_final, w = 3, fun = mean, na.rm = TRUE, NAonly = TRUE)
+
+```
+
+# Final dataset
+
+
+We first start with grid alignment. The explanatory variables have a resolution of 0.0083°, while the NDVI is at 0.0099°. 
+
+
+
+```{r}
+# 1. Use a climate variable as the "Reference Grid" (e.g., Elevation)
+reference <- elev 
+
+# 2. Force the NDVI to match the reference resolution and extent
+# We use 'bilinear' interpolation because NDVI is a continuous numerical value
+ndvi_res <- resample(ndvi_final, reference, method = "bilinear")
+
+# 3. Now that they have identical dimensions, we can stack them and create the final dataset for regression
+mydata <- c(ndvi_res,  elev,  southness, slope)
+#plot(mydata)
+df_final <- as.data.frame(mydata, xy = TRUE, na.rm = TRUE)
+colnames(df_final) <- c("lon", "lat", "ndvi", "elevation",  "southness", "slope")
+
+# 5. Verification
+summary(df_final)
+```
+
+# OLS Regression
+
+We consider  the following model, 
+$$ NDVI=\beta_0+\beta_1 Elevation +\beta_2 Southness +\beta_3 Slope + \boldsymbol{\varepsilon}$$
+The regression coefficients of Elevation and Slope are significant at the level 5%, the significance of Southness is more  doubtful with a p-value of 5,4%.
+
+As expected, the coefficient of Elevation is negative: Vegetation declines with increasing altitude.
+
+The Southness variable (calculated as $\cos(\text{aspect})$) ranges from 1 (due South) to -1 (due North). A negative coefficient means that as you move southward, the NDVI decreases. This might seem counter-intuitive since the South is sunnier, but it makes sense in the Pyrenees: The adret (south-facing slope) receives more solar radiation, which increases evapotranspiration. If the soil is thin or water is scarce, the vegetation is stressed, leading to a lower NDVI.The ubac (north-facing slope) is greener: North-facing slopes retain soil moisture better, allowing for denser and 'greener' vegetation (often coniferous or beech forests), which boosts the NDVI.
+
+The most surprising result of the model is the negativity of the coefficient of Slope, as steep slopes usually limit soil accumulation. However, in our specific context of this area of the Pyrenees mountains,  our findings align with local geography: Flat valley floors are often used for grazing and hay meadows. Frequent mowing or grazing keeps the biomass (and thus the NDVI) lower than in unmanaged areas. whereas the steepest gradients in this sector (between 1000m and 1800m) are home to dense beech and fir forests. Moreover,  some flat high-altitude areas are rocky basins or peat bogs, which naturally have lower NDVI values than the lush forests clinging to the mountain flanks.
+
+```{r}
+#variables correlations
+cor(df_final[, c("ndvi", "elevation","southness","slope")])
+
+
+# Simple linear model (OLS) 
+model <- lm(ndvi ~ elevation +southness + slope, data = df_final)
+summary(model)
+```
+
+We compute the residuals after OLS estimation, and study their spatial autocorrelation. We run a Moran's test with the 8 nearest neighbours neighbourhood.  We use $k=8$ neighbours  to mimic a 'Queen' contiguity on a grid.
+Note that  although we are using longitude/latitude (degrees), kNN remains  robust as it identifies the closest points regardless of the distance unit.
+
+The Moran's index  values is   0.75 and the  test concludes clearly that residuals are spatially correlated. 
+
+
+```{r}
+
+df_final$residuals <- residuals(model)
+
+# We run a Moran's test with the 8nn neighbourhood. 
+coords <- as.matrix(df_final[, c("lon", "lat")])
+nb <- knn2nb(knearneigh(coords, k = 8))
+listw <- nb2listw(nb, style = "W")#Convert to a spatial weights list (W-style: row-standardized)
+
+#  Perform the Moran's I test on OLS residuals
+test_moran <- lm.morantest(model, listw)
+print(test_moran)
+
+#map of the residuals
+res_map <- rast(df_final[, c("lon", "lat", "residuals")], type="xyz", crs=crs(elev))
+plot(res_map,   main = "Residuals ")
+```
+
+
+
+
+
